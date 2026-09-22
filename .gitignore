@@ -7,3 +7,8 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地演示/运行状态文件
+.state-*.json
+.demo-state.json
+*.local.json
