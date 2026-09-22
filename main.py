@@ -1,8 +1,6 @@
-from fastapi import FastAPI
+import os
 
-app = FastAPI()
+from app.api import create_app
+from app.service import Gateway
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app(Gateway(os.environ.get("IOT_GATEWAY_STORE")))
