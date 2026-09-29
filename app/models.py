@@ -41,6 +41,21 @@ class BatchState(str, Enum):
     IN_PROGRESS = "in_progress"
     SUCCEEDED = "succeeded"
     ROLLED_BACK = "rolled_back"
+    CANCELLED = "cancelled"
+
+
+class CampaignState(str, Enum):
+    """活动生命周期：运行 -> 暂停 <-> 继续；取消为终态。"""
+    ACTIVE = "active"
+    PAUSED = "paused"
+    CANCELLED = "cancelled"
+
+
+class UpgradeEventKind:
+    """单台设备升级往来的事件码（稳定字符串，落快照、进历史）。"""
+    STARTED = "upgrade_started"        # 批次开始：设备进入升级中
+    SUCCEEDED = "upgrade_succeeded"    # 批次成功：版本推进到目标版本
+    ROLLED_BACK = "upgrade_rolled_back"  # 批次回滚/活动取消：版本恢复
 
 
 class DeviceUpgradeState(str, Enum):
@@ -271,6 +286,7 @@ class Campaign:
     firmware_version: str
     batches: list[Batch] = field(default_factory=list)
     created_at: float = 0.0
+    state: CampaignState = CampaignState.ACTIVE
 
     def to_dict(self) -> dict:
         return {
@@ -278,6 +294,7 @@ class Campaign:
             "firmware_version": self.firmware_version,
             "batches": [b.to_dict() for b in self.batches],
             "created_at": self.created_at,
+            "state": _enum_value(self.state),
         }
 
     @classmethod
@@ -287,4 +304,72 @@ class Campaign:
             firmware_version=data["firmware_version"],
             batches=[Batch.from_dict(b) for b in data.get("batches", [])],
             created_at=data.get("created_at", 0.0),
+            state=CampaignState(data.get("state", "active")),
+        )
+
+
+@dataclass
+class DeviceOccupancy:
+    """设备占用关系：一台设备同一时刻最多被一个进行中的批次/活动占用。"""
+    device_id: str
+    campaign_id: str
+    batch_id: str
+    occupied_at: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "device_id": self.device_id,
+            "campaign_id": self.campaign_id,
+            "batch_id": self.batch_id,
+            "occupied_at": self.occupied_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DeviceOccupancy":
+        return cls(
+            device_id=data["device_id"],
+            campaign_id=data["campaign_id"],
+            batch_id=data["batch_id"],
+            occupied_at=data.get("occupied_at", 0.0),
+        )
+
+
+@dataclass
+class UpgradeEvent:
+    """单台设备的一次升级往来（只追加，按发生顺序排列）。"""
+    seq: int
+    device_id: str
+    campaign_id: str
+    batch_id: str
+    kind: str
+    from_version: str
+    to_version: str
+    ts: float
+    message: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "seq": self.seq,
+            "device_id": self.device_id,
+            "campaign_id": self.campaign_id,
+            "batch_id": self.batch_id,
+            "kind": self.kind,
+            "from_version": self.from_version,
+            "to_version": self.to_version,
+            "ts": self.ts,
+            "message": self.message,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "UpgradeEvent":
+        return cls(
+            seq=data["seq"],
+            device_id=data["device_id"],
+            campaign_id=data["campaign_id"],
+            batch_id=data["batch_id"],
+            kind=data["kind"],
+            from_version=data["from_version"],
+            to_version=data["to_version"],
+            ts=data["ts"],
+            message=data.get("message", ""),
         )

@@ -16,8 +16,10 @@ from app.models import (
     Campaign,
     Credential,
     Device,
+    DeviceOccupancy,
     FirmwareImage,
     TelemetryStats,
+    UpgradeEvent,
 )
 
 
@@ -30,6 +32,9 @@ class Store:
         self._stats: dict[str, TelemetryStats] = {}
         self._firmware: dict[str, FirmwareImage] = {}
         self._campaigns: dict[str, Campaign] = {}
+        self._occupancy: dict[str, DeviceOccupancy] = {}
+        self._upgrade_events: dict[str, list[UpgradeEvent]] = {}
+        self._upgrade_event_seq: int = 0
         self.load()
 
     def lock(self) -> threading.RLock:
@@ -47,6 +52,12 @@ class Store:
             "firmware": {k: v.to_dict() for k, v in self._firmware.items()},
             "campaigns": {k: v.to_dict()
                           for k, v in self._campaigns.items()},
+            "occupancy": {k: v.to_dict()
+                          for k, v in self._occupancy.items()},
+            "upgrade_events": {
+                k: [e.to_dict() for e in events]
+                for k, events in self._upgrade_events.items()},
+            "upgrade_event_seq": self._upgrade_event_seq,
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(self._path.parent),
@@ -77,6 +88,16 @@ class Store:
                           for k, v in data.get("firmware", {}).items()}
         self._campaigns = {k: Campaign.from_dict(v)
                            for k, v in data.get("campaigns", {}).items()}
+        self._occupancy = {
+            k: DeviceOccupancy.from_dict(v)
+            for k, v in data.get("occupancy", {}).items()}
+        self._upgrade_events = {
+            k: [UpgradeEvent.from_dict(e) for e in events]
+            for k, events in data.get("upgrade_events", {}).items()}
+        self._upgrade_event_seq = data.get(
+            "upgrade_event_seq",
+            max((e.seq for events in self._upgrade_events.values()
+                 for e in events), default=0))
 
     # ---- devices ---------------------------------------------------------
     def put_device(self, device: Device) -> None:
@@ -128,3 +149,32 @@ class Store:
 
     def list_campaigns(self) -> list[Campaign]:
         return list(self._campaigns.values())
+
+    # ---- device occupancy -----------------------------------------------
+    def get_occupancy(self, device_id: str) -> DeviceOccupancy | None:
+        return self._occupancy.get(device_id)
+
+    def list_occupancy(self) -> list[DeviceOccupancy]:
+        return list(self._occupancy.values())
+
+    def put_occupancy(self, occ: DeviceOccupancy) -> None:
+        self._occupancy[occ.device_id] = occ
+
+    def remove_occupancy(self, device_id: str) -> None:
+        self._occupancy.pop(device_id, None)
+
+    def replace_all_occupancy(self, occs: dict[str, DeviceOccupancy]) -> None:
+        self._occupancy = dict(occs)
+
+    # ---- per-device upgrade history -------------------------------------
+    def append_upgrade_event(self, event: UpgradeEvent) -> UpgradeEvent:
+        """分配全局单调 seq 并追加（调用方需持有 store 锁）。"""
+        self._upgrade_event_seq += 1
+        event.seq = self._upgrade_event_seq
+        self._upgrade_events.setdefault(event.device_id, []).append(event)
+        return event
+
+    def list_upgrade_events(self, device_id: str) -> list[UpgradeEvent]:
+        """返回该设备按发生顺序（seq 升序）的升级往来副本。"""
+        return sorted(self._upgrade_events.get(device_id, []),
+                      key=lambda e: e.seq)

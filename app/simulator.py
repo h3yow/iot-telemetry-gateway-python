@@ -2,7 +2,9 @@
 
 在不依赖任何外部服务的前提下，完整走一遍：
   注册设备 -> 签发凭据 -> 鉴权遥测（正常/乱序/重复/回跳/非法/超限/吊销）
-  -> 发布固件 -> 两批次灰度（成功批 + 失败回滚批）-> 重启一致性检查。
+  -> 发布固件 -> 两批次灰度（成功批 + 失败回滚批）
+  -> 设备占用治理（跨活动争抢 / 暂停 / 继续 / 取消幂等 / 升级往来）
+  -> 重启一致性检查。
 
 运行：
     uv run python -m app.simulator                 # 纯内存
@@ -113,6 +115,51 @@ def run_demo(store_path: str | None = None) -> dict[str, Any]:
     report["versions"] = {
         d: gw.store.get_device(d).firmware_version
         for d in ("sensor-b", "sensor-c", "sensor-d", "sensor-e")}
+
+    # 6.1) 设备占用治理：新开活动 A/B 针对同一批设备，演示跨活动争抢、
+    #      暂停/继续、取消幂等、占用释放与升级往来。
+    for d in ("sensor-f", "sensor-g", "sensor-h"):
+        gw.auth.register_device(d)
+    gw.upgrade.release_firmware("4.0.0")
+    gw.upgrade.release_firmware("5.0.0")
+    gov_a = gw.upgrade.create_campaign(
+        "4.0.0", ["sensor-f", "sensor-g", "sensor-h"], batch_size=2)
+    gov_b = gw.upgrade.create_campaign(
+        "5.0.0", ["sensor-f", "sensor-g", "sensor-h"], batch_size=3)
+    aid = gov_a.campaign_id
+    ab0, ab1 = (gov_a.batches[0].batch_id,
+                gov_a.batches[1].batch_id)
+    # A 第一批成功（占用随之释放）
+    step("gov_a_batch0_ok", {"ok": True, "batch": gw.upgrade.upgrade_batch(
+        aid, ab0, health_results={})})
+    # 暂停 -> 推进新批次被拒；重复暂停幂等
+    step("gov_pause", {"ok": True, **gw.upgrade.pause_campaign(aid)})
+    step("gov_pause_idempotent", {"ok": True,
+                                  **gw.upgrade.pause_campaign(aid)})
+    step("gov_advance_while_paused", _guard(
+        gw.upgrade.upgrade_batch, aid, ab1))
+    # 继续（幂等）后从断点开始第二批，停在进行中 -> 占用挂着
+    step("gov_resume", {"ok": True, **gw.upgrade.resume_campaign(aid)})
+    step("gov_resume_idempotent", {"ok": True,
+                                   **gw.upgrade.resume_campaign(aid)})
+    step("gov_a_batch1_started", {"ok": True, "batch": gw.upgrade.upgrade_batch(
+        aid, ab1)})
+    # B 抢同一批设备：device_occupied，立即拒绝、版本不动
+    step("gov_b_contention_rejected", _guard(
+        gw.upgrade.upgrade_batch, gov_b.campaign_id,
+        gov_b.batches[0].batch_id, health_results={}))
+    report["gov_occupancy_inflight"] = gw.upgrade.device_occupancy("sensor-h")
+    # 进行中批次在暂停语义下仍可上报；这里直接上报健康 -> 成功并释放占用
+    step("gov_a_batch1_report", {"ok": True, "batch": gw.upgrade.report_device(
+        aid, ab1, "sensor-h", True)})
+    # 对 B 取消（尚未开始的批次全部 cancelled），重复取消幂等
+    step("gov_b_cancel", {"ok": True,
+                          **gw.upgrade.cancel_campaign(gov_b.campaign_id)})
+    step("gov_b_cancel_idempotent", {
+        "ok": True, **gw.upgrade.cancel_campaign(gov_b.campaign_id)})
+    report["gov_occupancy_released"] = gw.upgrade.device_occupancy("sensor-h")
+    report["gov_history_sensor_h"] = gw.upgrade.device_upgrade_history(
+        "sensor-h")
 
     # 7) 重启一致性（仅在使用快照路径时有意义）
     if store_path:

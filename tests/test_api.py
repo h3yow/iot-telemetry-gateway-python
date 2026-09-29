@@ -148,3 +148,73 @@ def test_http_concurrent_upgrade(gateway):
         t.join()
     assert statuses.count(200) == 1
     assert statuses.count(409) == 5
+
+
+def _make_campaign(client, version, devices, batch_size=2):
+    for d in devices:
+        client.post(f"/api/v1/devices/{d}/register", json={})
+    client.post("/api/v1/firmware", json={"version": version})
+    r = client.post("/api/v1/campaigns",
+                    json={"firmware_version": version,
+                          "device_ids": list(devices),
+                          "batch_size": batch_size})
+    return r.json()["campaign"]
+
+
+def test_http_cross_campaign_occupancy_distinguishable(gateway):
+    client = _client(gateway)
+    c1 = _make_campaign(client, "2.0.0", ["g1", "g2"])
+    c2 = _make_campaign(client, "3.0.0", ["g1", "g2"])
+    # 活动一进行中占用设备
+    r = client.post(
+        f"/api/v1/campaigns/{c1['campaign_id']}/batches/"
+        f"{c1['batches'][0]['batch_id']}/upgrade", json={})
+    assert r.status_code == 200
+    # 活动二争抢被拒：独立原因 device_occupied
+    r = client.post(
+        f"/api/v1/campaigns/{c2['campaign_id']}/batches/"
+        f"{c2['batches'][0]['batch_id']}/upgrade",
+        json={"health_results": {}})
+    assert r.status_code == 409
+    assert r.json()["detail"]["reason"] == "device_occupied"
+    # 占用查询
+    r = client.get("/api/v1/devices/g1/occupancy")
+    body = r.json()
+    assert body["occupied"] is True
+    assert body["campaign_id"] == c1["campaign_id"]
+
+
+def test_http_pause_resume_cancel_and_history(gateway):
+    client = _client(gateway)
+    camp = _make_campaign(client, "2.0.0",
+                          ["h1", "h2", "h3", "h4"], batch_size=2)
+    cid = camp["campaign_id"]
+    b0, b1 = camp["batches"][0]["batch_id"], camp["batches"][1]["batch_id"]
+    client.post(f"/api/v1/campaigns/{cid}/batches/{b0}/upgrade",
+                json={"health_results": {}})
+
+    r = client.post(f"/api/v1/campaigns/{cid}/pause", json={})
+    assert r.status_code == 200 and r.json()["state"] == "paused"
+    # 暂停后推进被拒
+    r = client.post(f"/api/v1/campaigns/{cid}/batches/{b1}/upgrade",
+                    json={"health_results": {}})
+    assert r.status_code == 409
+    assert r.json()["detail"]["reason"] == "campaign_paused"
+    # 继续后可推进
+    r = client.post(f"/api/v1/campaigns/{cid}/resume", json={})
+    assert r.status_code == 200 and r.json()["state"] == "active"
+    r = client.post(f"/api/v1/campaigns/{cid}/batches/{b1}/upgrade",
+                    json={"health_results": {}})
+    assert r.status_code == 200
+    # 全部批次终态后重复取消幂等
+    r1 = client.post(f"/api/v1/campaigns/{cid}/cancel", json={})
+    r2 = client.post(f"/api/v1/campaigns/{cid}/cancel", json={})
+    assert r1.status_code == r2.status_code == 200
+    assert r1.json()["state"] == r2.json()["state"] == "cancelled"
+
+    # 升级往来可查、顺序正确
+    r = client.get("/api/v1/devices/h1/upgrade-history")
+    kinds = [e["kind"] for e in r.json()["events"]]
+    assert kinds == ["upgrade_started", "upgrade_succeeded"]
+    # 未注册设备查询 404
+    assert client.get("/api/v1/devices/ghost/occupancy").status_code == 404
