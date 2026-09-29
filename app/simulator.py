@@ -2,7 +2,9 @@
 
 在不依赖任何外部服务的前提下，完整走一遍：
   注册设备 -> 签发凭据 -> 鉴权遥测（正常/乱序/重复/回跳/非法/超限/吊销）
-  -> 发布固件 -> 两批次灰度（成功批 + 失败回滚批）-> 重启一致性检查。
+  -> 发布固件 -> 两批次灰度（成功批 + 失败回滚批）
+  -> 跨活动设备占用争抢 -> 暂停/继续 -> 取消（进行中回滚/待开始取消）
+  -> 重启一致性检查。
 
 运行：
     uv run python -m app.simulator                 # 纯内存
@@ -114,10 +116,77 @@ def run_demo(store_path: str | None = None) -> dict[str, Any]:
         d: gw.store.get_device(d).firmware_version
         for d in ("sensor-b", "sensor-c", "sensor-d", "sensor-e")}
 
-    # 7) 重启一致性（仅在使用快照路径时有意义）
+    # 7) 设备占用治理：两个活动共享 sensor-g，并发争抢只有一个成功
+    for d in ("sensor-f", "sensor-g", "sensor-h", "sensor-i"):
+        gw.auth.register_device(d)
+    gw.upgrade.release_firmware("3.0.0")
+    camp_a = gw.upgrade.create_campaign(
+        "2.0.0", ["sensor-f", "sensor-g", "sensor-i"], batch_size=2)
+    camp_b = gw.upgrade.create_campaign(
+        "3.0.0", ["sensor-g", "sensor-h"], batch_size=2)
+    step("occupation_campaign_a_start",
+         {"ok": True, "batch": gw.upgrade.upgrade_batch(
+             camp_a.campaign_id, camp_a.batches[0].batch_id)})
+    step("occupation_campaign_b_rejected", _guard(
+        gw.upgrade.upgrade_batch,
+        camp_b.campaign_id, camp_b.batches[0].batch_id))
+    report["occupation_sensor_g"] = gw.upgrade.device_occupation("sensor-g")
+    # 第一批从断点逐台上报成功后暂停：第二批 PENDING 被 campaign_paused 挡住
+    step("campaign_a_report_f",
+         {"ok": True, "batch": gw.upgrade.report_device(
+             camp_a.campaign_id, camp_a.batches[0].batch_id,
+             "sensor-f", ok=True)})
+    step("campaign_a_report_g_succeeds",
+         {"ok": True, "batch": gw.upgrade.report_device(
+             camp_a.campaign_id, camp_a.batches[0].batch_id,
+             "sensor-g", ok=True)})
+    step("campaign_a_pause",
+         {"ok": True, **gw.upgrade.pause_campaign(camp_a.campaign_id)})
+    step("campaign_a_pause_again_idempotent",
+         {"ok": True, **gw.upgrade.pause_campaign(camp_a.campaign_id)})
+    step("campaign_a_paused_new_batch_rejected", _guard(
+        gw.upgrade.upgrade_batch,
+        camp_a.campaign_id, camp_a.batches[1].batch_id))
+    step("campaign_a_resume",
+         {"ok": True, **gw.upgrade.resume_campaign(camp_a.campaign_id)})
+    step("campaign_a_second_batch",
+         {"ok": True, "batch": gw.upgrade.upgrade_batch(
+             camp_a.campaign_id, camp_a.batches[1].batch_id,
+             health_results={})})
+    # 释放后活动 B 可以收走 sensor-g
+    step("occupation_released_then_campaign_b",
+         {"ok": True, "batch": gw.upgrade.upgrade_batch(
+             camp_b.campaign_id, camp_b.batches[0].batch_id,
+             health_results={})})
+
+    # 8) 取消第三个活动：进行中的批次回滚、待开始批次取消、已成功批次不动
+    for d in ("sensor-j", "sensor-k", "sensor-l"):
+        gw.auth.register_device(d)
+    gw.upgrade.release_firmware("4.0.0")
+    camp_c = gw.upgrade.create_campaign(
+        "4.0.0", ["sensor-j", "sensor-k", "sensor-l"], batch_size=1)
+    gw.upgrade.upgrade_batch(camp_c.campaign_id,
+                             camp_c.batches[0].batch_id, health_results={})
+    gw.upgrade.upgrade_batch(camp_c.campaign_id,
+                             camp_c.batches[1].batch_id)
+    step("campaign_c_cancel",
+         {"ok": True, **gw.upgrade.cancel_campaign(camp_c.campaign_id)})
+    step("campaign_c_cancel_again_idempotent",
+         {"ok": True, **gw.upgrade.cancel_campaign(camp_c.campaign_id)})
+    report["upgrade_history_sensor_g"] = gw.upgrade.device_upgrade_history(
+        "sensor-g")
+    report["occupation_sensor_g_after"] = gw.upgrade.device_occupation(
+        "sensor-g")
+
+    # 9) 重启一致性（仅在使用快照路径时有意义）
     if store_path:
         gw2 = Gateway(store_path)
-        report["after_restart"] = gw2.upgrade.campaign_progress(cid)
+        report["after_restart"] = {
+            "campaign_progress": gw2.upgrade.campaign_progress(cid),
+            "occupation_sensor_g": gw2.upgrade.device_occupation("sensor-g"),
+            "history_sensor_k": gw2.upgrade.device_upgrade_history(
+                "sensor-k"),
+        }
 
     return report
 

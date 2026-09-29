@@ -25,9 +25,13 @@ from app.models import (
     Batch,
     BatchState,
     Campaign,
+    CampaignState,
+    DeviceOccupation,
     DeviceUpgrade,
     DeviceUpgradeState,
     FirmwareImage,
+    UpgradeEvent,
+    UpgradeEventType,
 )
 from app.store import Store
 
@@ -102,6 +106,13 @@ class UpgradeService:
                 campaign_id, firmware_version, len(device_ids), len(batches))
             return campaign
 
+    def _require_campaign(self, campaign_id: str) -> Campaign:
+        campaign = self.store.get_campaign(campaign_id)
+        if campaign is None:
+            raise NotFoundError("campaign_not_found",
+                                f"升级活动 {campaign_id} 不存在")
+        return campaign
+
     def _find(self, campaign_id: str, batch_id: str
               ) -> tuple[Campaign, Batch]:
         campaign = self.store.get_campaign(campaign_id)
@@ -129,27 +140,60 @@ class UpgradeService:
             if batch.state == BatchState.IN_PROGRESS:
                 raise ConflictError("batch_in_progress",
                                     f"批次 {batch_id} 正在升级中")
+            if batch.state == BatchState.CANCELLED:
+                raise ConflictError("batch_cancelled",
+                                    f"批次 {batch_id} 已随活动取消")
             # 严格按批次顺序推进
             for prev in campaign.batches:
                 if prev.order < batch.order and prev.state != BatchState.SUCCEEDED:
                     raise ConflictError(
                         "previous_batch_not_succeeded",
                         f"前序批次 {prev.batch_id} 状态为 {prev.state.value}")
+            # 活动生命周期：暂停后不能开启新批次，取消后一切推进停止
+            if campaign.state == CampaignState.PAUSED:
+                raise ConflictError(
+                    "campaign_paused",
+                    f"活动 {campaign_id} 已暂停，不能推进新批次")
+            if campaign.state == CampaignState.CANCELLED:
+                raise ConflictError(
+                    "campaign_cancelled",
+                    f"活动 {campaign_id} 已取消，不能推进批次")
+
+            # 设备占用：本批次所有设备必须未被其他进行中的活动占着。
+            # 检查与占用在同一把锁内原子完成，并发争抢只有一方能成功，
+            # 失败方立即被拒（独立原因码），不改动任何设备。
+            for device_id in batch.device_ids:
+                occupation = self.store.get_occupation(device_id)
+                if occupation is not None \
+                        and occupation.campaign_id != campaign_id:
+                    raise ConflictError(
+                        "device_occupied_by_other_campaign",
+                        f"设备 {device_id} 正被活动 "
+                        f"{occupation.campaign_id} 占用")
 
             target = campaign.firmware_version
+            now = self.clock()
             # 进入 IN_PROGRESS 并先落盘（中途失败重启也能看到一致中间态）
             for device_id in batch.device_ids:
                 device = self.store.get_device(device_id)
+                from_version = device.firmware_version
                 device.upgrade_state = DeviceUpgradeState.UPGRADING
                 device.target_version = target
                 device.campaign_id = campaign_id
                 self.store.put_device(device)
+                self.store.put_occupation(DeviceOccupation(
+                    device_id=device_id, campaign_id=campaign_id,
+                    batch_id=batch_id, acquired_at=now))
                 batch.upgrades[device_id] = DeviceUpgrade(
                     device_id=device_id,
-                    from_version=device.firmware_version,
+                    from_version=from_version,
                     to_version=target,
                     state=DeviceUpgradeState.UPGRADING,
                 )
+                self._append_event(
+                    device_id, campaign_id, batch_id,
+                    UpgradeEventType.STARTED,
+                    from_version, target, "批次开始升级")
             batch.state = BatchState.IN_PROGRESS
             self.store.put_campaign(campaign)
             self.store.save()
@@ -229,6 +273,12 @@ class UpgradeService:
                     device.upgrade_state = DeviceUpgradeState.ROLLED_BACK
                     up.message = up.message or "同批存在失败设备，整批回滚"
                 self.store.put_device(device)
+                # 终态释放占用，并记录本次回滚往来
+                self.store.delete_occupation(up.device_id)
+                self._append_event(
+                    up.device_id, campaign.campaign_id, batch.batch_id,
+                    UpgradeEventType.ROLLED_BACK,
+                    up.from_version, up.to_version, up.message)
             batch.state = BatchState.ROLLED_BACK
             logger.info(
                 "batch rolled back campaign=%s batch=%s failed_devices=%s",
@@ -245,12 +295,122 @@ class UpgradeService:
                 up.state = DeviceUpgradeState.ON_TARGET
                 up.healthy = True
                 self.store.put_device(device)
+                # 终态释放占用，并记录本次成功往来
+                self.store.delete_occupation(up.device_id)
+                self._append_event(
+                    up.device_id, campaign.campaign_id, batch.batch_id,
+                    UpgradeEventType.SUCCEEDED,
+                    up.from_version, up.to_version, "升级成功")
             batch.state = BatchState.SUCCEEDED
             logger.info("batch succeeded campaign=%s batch=%s",
                         campaign.campaign_id, batch.batch_id)
         self.store.put_campaign(campaign)
         self.store.save()
         return batch.to_dict()
+
+    def _append_event(self, device_id: str, campaign_id: str, batch_id: str,
+                      event_type: UpgradeEventType, from_version: str,
+                      to_version: str, message: str = "") -> None:
+        """追加单台设备升级往来。调用方须已持有 Store 锁。"""
+        seq = self.store.next_event_seq(device_id)
+        self.store.append_upgrade_event(UpgradeEvent(
+            seq=seq, device_id=device_id, campaign_id=campaign_id,
+            batch_id=batch_id, event_type=event_type,
+            from_version=from_version, to_version=to_version,
+            at=self.clock(), message=message))
+
+    def device_occupation(self, device_id: str) -> dict:
+        """查询设备当前被哪个活动占着；未被占用时 occupied=False。"""
+        with self.store.lock():
+            if self.store.get_device(device_id) is None:
+                raise NotFoundError("device_not_registered",
+                                    f"设备 {device_id} 未注册")
+            occupation = self.store.get_occupation(device_id)
+            if occupation is None:
+                return {"device_id": device_id, "occupied": False}
+            return {"device_id": device_id, "occupied": True,
+                    "occupation": occupation.to_dict()}
+
+    def device_upgrade_history(self, device_id: str) -> dict:
+        """设备历次升级往来，顺序与实际发生顺序一致（重启后仍在）。"""
+        with self.store.lock():
+            if self.store.get_device(device_id) is None:
+                raise NotFoundError("device_not_registered",
+                                    f"设备 {device_id} 未注册")
+            events = [e.to_dict()
+                      for e in self.store.list_upgrade_events(device_id)]
+            return {"device_id": device_id, "events": events}
+
+    # ---- 活动生命周期：暂停 / 继续 / 取消 --------------------------------
+    def pause_campaign(self, campaign_id: str) -> dict:
+        """暂停活动：之后不能开始新批次；重复暂停幂等。"""
+        with self.store.lock():
+            campaign = self._require_campaign(campaign_id)
+            if campaign.state == CampaignState.CANCELLED:
+                raise ConflictError(
+                    "campaign_cancelled",
+                    f"活动 {campaign_id} 已取消，不能暂停")
+            campaign.state = CampaignState.PAUSED
+            self.store.put_campaign(campaign)
+            self.store.save()
+            logger.info("campaign paused id=%s", campaign_id)
+            return self.campaign_progress(campaign_id)
+
+    def resume_campaign(self, campaign_id: str) -> dict:
+        """继续活动：从原断点接着推进；对活动中的活动调用幂等。"""
+        with self.store.lock():
+            campaign = self._require_campaign(campaign_id)
+            if campaign.state == CampaignState.CANCELLED:
+                raise ConflictError(
+                    "campaign_cancelled",
+                    f"活动 {campaign_id} 已取消，不能继续")
+            campaign.state = CampaignState.ACTIVE
+            self.store.put_campaign(campaign)
+            self.store.save()
+            logger.info("campaign resumed id=%s", campaign_id)
+            return self.campaign_progress(campaign_id)
+
+    def cancel_campaign(self, campaign_id: str,
+                        message: str = "活动取消") -> dict:
+        """取消活动：只处理仍在进行中的部分并释放设备，已终态部分不动。
+
+        - 进行中批次：整批回滚到各设备升级前版本（只发生一次）；
+        - 待开始批次：标记为 cancelled，不占用设备；
+        - 已成功/已回滚批次：原样保留。
+        重复取消幂等。
+        """
+        with self.store.lock():
+            campaign = self._require_campaign(campaign_id)
+            if campaign.state == CampaignState.CANCELLED:
+                return self.campaign_progress(campaign_id)
+
+            for batch in campaign.batches:
+                if batch.state == BatchState.IN_PROGRESS:
+                    # 复用既有整批回滚路径，保证版本恢复只发生一次
+                    for up in batch.upgrades.values():
+                        up.healthy = False
+                        if not up.message:
+                            up.message = message
+                    self._finalize(campaign, batch)
+                elif batch.state == BatchState.PENDING:
+                    batch.state = BatchState.CANCELLED
+                    # 待开始批次从未占用设备、版本从未变化；仅记录取消往来，
+                    # from/to 均为设备当前版本（没有发生实际升级）。
+                    for device_id in batch.device_ids:
+                        device = self.store.get_device(device_id)
+                        current = device.firmware_version
+                        self._append_event(
+                            device_id, campaign_id, batch.batch_id,
+                            UpgradeEventType.CANCELLED,
+                            current, current, message)
+                    logger.info(
+                        "batch cancelled with campaign campaign=%s batch=%s",
+                        campaign_id, batch.batch_id)
+            campaign.state = CampaignState.CANCELLED
+            self.store.put_campaign(campaign)
+            self.store.save()
+            logger.info("campaign cancelled id=%s", campaign_id)
+            return self.campaign_progress(campaign_id)
 
     def campaign_progress(self, campaign_id: str) -> dict:
         with self.store.lock():
@@ -262,13 +422,14 @@ class UpgradeService:
             counts: dict[str, int] = {}
             for b in campaign.batches:
                 counts[b.state.value] = counts.get(b.state.value, 0) + 1
+            terminal = (BatchState.SUCCEEDED, BatchState.ROLLED_BACK,
+                        BatchState.CANCELLED)
             return {
                 "campaign_id": campaign_id,
                 "firmware_version": campaign.firmware_version,
+                "state": campaign.state.value,
                 "batch_count": len(batches),
                 "state_counts": counts,
-                "finished": all(b.state in (BatchState.SUCCEEDED,
-                                            BatchState.ROLLED_BACK)
-                                for b in campaign.batches),
+                "finished": all(b.state in terminal for b in campaign.batches),
                 "batches": batches,
             }

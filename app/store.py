@@ -16,8 +16,10 @@ from app.models import (
     Campaign,
     Credential,
     Device,
+    DeviceOccupation,
     FirmwareImage,
     TelemetryStats,
+    UpgradeEvent,
 )
 
 
@@ -30,6 +32,8 @@ class Store:
         self._stats: dict[str, TelemetryStats] = {}
         self._firmware: dict[str, FirmwareImage] = {}
         self._campaigns: dict[str, Campaign] = {}
+        self._occupations: dict[str, DeviceOccupation] = {}
+        self._upgrade_events: dict[str, list[UpgradeEvent]] = {}
         self.load()
 
     def lock(self) -> threading.RLock:
@@ -47,6 +51,11 @@ class Store:
             "firmware": {k: v.to_dict() for k, v in self._firmware.items()},
             "campaigns": {k: v.to_dict()
                           for k, v in self._campaigns.items()},
+            "device_occupations": {
+                k: v.to_dict() for k, v in self._occupations.items()},
+            "upgrade_events": {
+                k: [e.to_dict() for e in events]
+                for k, events in self._upgrade_events.items()},
         }
         self._path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(self._path.parent),
@@ -77,6 +86,12 @@ class Store:
                           for k, v in data.get("firmware", {}).items()}
         self._campaigns = {k: Campaign.from_dict(v)
                            for k, v in data.get("campaigns", {}).items()}
+        self._occupations = {
+            k: DeviceOccupation.from_dict(v)
+            for k, v in data.get("device_occupations", {}).items()}
+        self._upgrade_events = {
+            k: [UpgradeEvent.from_dict(e) for e in events]
+            for k, events in data.get("upgrade_events", {}).items()}
 
     # ---- devices ---------------------------------------------------------
     def put_device(self, device: Device) -> None:
@@ -128,3 +143,36 @@ class Store:
 
     def list_campaigns(self) -> list[Campaign]:
         return list(self._campaigns.values())
+
+    # ---- device occupations ---------------------------------------------
+    def get_occupation(self, device_id: str) -> DeviceOccupation | None:
+        return self._occupations.get(device_id)
+
+    def put_occupation(self, occupation: DeviceOccupation) -> None:
+        self._occupations[occupation.device_id] = occupation
+
+    def delete_occupation(self, device_id: str) -> None:
+        self._occupations.pop(device_id, None)
+
+    def occupations_for_campaign(self, campaign_id: str
+                                 ) -> list[DeviceOccupation]:
+        return [o for o in self._occupations.values()
+                if o.campaign_id == campaign_id]
+
+    # ---- per-device upgrade events --------------------------------------
+    def append_upgrade_event(self, event: UpgradeEvent) -> None:
+        self._upgrade_events.setdefault(
+            event.device_id, []).append(event)
+
+    def list_upgrade_events(self, device_id: str | None = None
+                            ) -> list[UpgradeEvent]:
+        if device_id is not None:
+            return list(self._upgrade_events.get(device_id, []))
+        events: list[UpgradeEvent] = []
+        for device_events in self._upgrade_events.values():
+            events.extend(device_events)
+        return events
+
+    def next_event_seq(self, device_id: str) -> int:
+        events = self._upgrade_events.get(device_id, [])
+        return (events[-1].seq + 1) if events else 1

@@ -177,6 +177,54 @@ def rollback_batch(campaign_id: str, batch_id: str, request: Request):
     return {"ok": True, "batch": batch}
 
 
+@router.post("/campaigns/{campaign_id}/pause")
+def pause_campaign(campaign_id: str, request: Request):
+    try:
+        progress = get_gateway(request).upgrade.pause_campaign(campaign_id)
+    except GatewayError as exc:
+        _raise(exc)
+    return {"ok": True, **progress}
+
+
+@router.post("/campaigns/{campaign_id}/resume")
+def resume_campaign(campaign_id: str, request: Request):
+    try:
+        progress = get_gateway(request).upgrade.resume_campaign(campaign_id)
+    except GatewayError as exc:
+        _raise(exc)
+    return {"ok": True, **progress}
+
+
+@router.post("/campaigns/{campaign_id}/cancel")
+def cancel_campaign(campaign_id: str, request: Request):
+    body = request.state.json_body
+    try:
+        progress = get_gateway(request).upgrade.cancel_campaign(
+            campaign_id, message=str(body.get("message", "活动取消")))
+    except GatewayError as exc:
+        _raise(exc)
+    return {"ok": True, **progress}
+
+
+@router.get("/devices/{device_id}/occupation")
+def get_device_occupation(device_id: str, request: Request):
+    try:
+        result = get_gateway(request).upgrade.device_occupation(device_id)
+    except GatewayError as exc:
+        _raise(exc)
+    return {"ok": True, **result}
+
+
+@router.get("/devices/{device_id}/upgrade-history")
+def get_device_upgrade_history(device_id: str, request: Request):
+    try:
+        result = get_gateway(request).upgrade.device_upgrade_history(
+            device_id)
+    except GatewayError as exc:
+        _raise(exc)
+    return {"ok": True, **result}
+
+
 @router.get("/devices")
 def list_devices(request: Request):
     return {"ok": True,
