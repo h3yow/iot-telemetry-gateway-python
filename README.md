@@ -136,9 +136,15 @@ PENDING ──upgrade_batch(开始)──▶ IN_PROGRESS ──全部设备健�
   批次内任一设备被占则整批不开始）；
 - **自动释放**：批次走到 `SUCCEEDED` / `ROLLED_BACK`，或活动取消引发进行中
   批次回滚后，占用立即释放；之后设备可正常参加新活动；
-- **重启一致**：占用关系持久化在快照的 `device_occupations` 中。服务在占用期间
-  重启，恢复后的占用、活动状态、设备版本与重启前完全一致——重启后另一活动仍抢
-  不到同一台设备，只有等原批次走到终态释放后才行；
+- **重启 / 版本升级恢复**：占用关系持久化在快照的 `device_occupations` 中；
+  此外每次加载快照时都会以「进行中批次」为准**重建占用**——
+  - 从上一版原地升级、沿用没有 `device_occupations` 字段的旧快照时，
+    仍有进行中批次（设备停在 `upgrading`）的占用会被推导恢复：
+    只要批次没走到成功/回滚/取消这些终态，它名下的设备就仍被占着，
+    占用查询能查到活动与批次，跨活动争抢仍按
+    `device_occupied_by_other_campaign` 拒绝；
+  - 快照里残留指向已终态/不存在批次的占用会被清掉，不会卡住不释放；
+  - 重建是幂等的：反复重启结果一致，不会重复占上、也不会凭空消失；
 - 查询：`GET /api/v1/devices/{id}/occupation` 返回当前占用它的活动与批次，
   未被占用时 `occupied: false`。
 
@@ -172,9 +178,16 @@ PENDING ──upgrade_batch(开始)──▶ IN_PROGRESS ──全部设备健�
 | `upgrade_rolled_back` | 健康失败/人工回滚/活动取消导致整批回滚 |
 | `upgrade_cancelled` | 设备随待开始批次被活动取消（未实际升级） |
 
+每条事件的 `from_version` / `to_version` 表示**这次往来里设备真实的版本
+变化**：回滚事件的落点（`to_version`）是设备退回后的原版本，而不是当初要
+升上去的目标版本。因此把一台设备的往来按 `seq` 顺序连起来，每条的
+`to_version` 都衔接下一条的 `from_version`，最后一条的 `to_version`
+就是设备当前所在版本——重启后依然成立。
+
 > 兼容范围：`upgrade_cancelled` 当前仅记录随待开始批次取消的设备（这些设备
 > 从未被占用、版本从未变化）；进行中批次被取消时走回滚路径，记为
 > `upgrade_rolled_back`。记录只追加、顺序号 `seq` 每台设备内单调递增。
+> 旧版本快照里没有 `upgrade_events` 字段时按空历史处理，不影响占用恢复。
 
 ### 4.4 新增拒绝原因码（均 409，彼此可区分）
 
@@ -220,6 +233,10 @@ uv run pytest -q
 
 # 压一压并发争抢（屏障同步的两个活动同时开跑），多跑几轮
 uv run pytest tests/test_governance.py -q
+
+# 重启/原地升级恢复场景（旧快照占用重建、回滚落点、反复重启幂等），
+# 用例日志会打印覆盖的业务场景与关键断言点
+uv run pytest tests/test_recovery.py -o log_cli=true -o log_cli_level=INFO -q
 
 # 只看遥测测试的判定日志（设备标识/序号/依据）
 uv run pytest tests/test_telemetry.py -o log_cli=true -o log_cli_level=INFO -q
@@ -267,5 +284,9 @@ curl -s localhost:8000/api/v1/devices/d1/upgrade-history
 | 重复取消不二次回滚、不追加记录、不改版本 | `tests/test_governance.py::test_cancel_is_idempotent_no_double_rollback` |
 | 往来记录顺序与实际一致、跨活动连续可查 | `tests/test_governance.py::test_device_history_order_matches_occurrence` |
 | 占用/活动状态/版本/记录重启一致，重启后仍互斥 | `tests/test_governance.py::test_occupation_and_history_survive_restart` |
+| 沿用上一版快照原地升级：占用恢复、争抢拒绝、原批次继续推进 | `tests/test_recovery.py::test_legacy_snapshot_in_progress_batch_still_occupies` |
+| 回滚往来版本落点与设备真实版本一致，重启后可一路追到当前版本 | `tests/test_recovery.py::test_rollback_history_versions_match_real_landing` |
+| 反复重启占用不丢不重，终态释放与取消幂等 | `tests/test_recovery.py::test_repeated_restarts_keep_occupation_and_release_idempotent` |
+| 残留指向终态批次的占用重启后被清掉 | `tests/test_recovery.py::test_stale_occupation_of_terminal_batch_is_dropped` |
 | HTTP 跨活动并发争抢返回可区分原因码 | `tests/test_governance.py::test_concurrent_http_contention_distinguishable_reason` |
 | HTTP 入口结论与门面一致 | `tests/test_api.py` |

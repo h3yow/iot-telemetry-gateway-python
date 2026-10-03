@@ -214,7 +214,8 @@ def test_device_history_order_matches_occurrence(gateway):
     assert [e["seq"] for e in hist["events"]] == [1, 2, 3, 4]
     versions = [(e["from_version"], e["to_version"])
                 for e in hist["events"]]
-    assert versions == [("1.0.0", "2.0.0"), ("1.0.0", "2.0.0"),
+    # 回滚事件的落点是设备真实退回的版本，往来链按顺序能追到当前版本
+    assert versions == [("1.0.0", "2.0.0"), ("2.0.0", "1.0.0"),
                         ("1.0.0", "3.0.0"), ("1.0.0", "3.0.0")]
     # 占用查询
     free = gateway.upgrade.device_occupation("dev-2")

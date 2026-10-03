@@ -273,12 +273,14 @@ class UpgradeService:
                     device.upgrade_state = DeviceUpgradeState.ROLLED_BACK
                     up.message = up.message or "同批存在失败设备，整批回滚"
                 self.store.put_device(device)
-                # 终态释放占用，并记录本次回滚往来
+                # 终态释放占用，并记录本次回滚往来。回滚事件的版本变化
+                # 必须反映设备真实落点：从尝试的目标版本退回原版本，
+                # 这样往来记录按顺序能一路追到设备当前版本。
                 self.store.delete_occupation(up.device_id)
                 self._append_event(
                     up.device_id, campaign.campaign_id, batch.batch_id,
                     UpgradeEventType.ROLLED_BACK,
-                    up.from_version, up.to_version, up.message)
+                    up.to_version, up.from_version, up.message)
             batch.state = BatchState.ROLLED_BACK
             logger.info(
                 "batch rolled back campaign=%s batch=%s failed_devices=%s",

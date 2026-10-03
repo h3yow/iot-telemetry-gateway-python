@@ -2,25 +2,34 @@
 
 - 内存对象 + 每次变更后原子写入 JSON 快照（tmp + os.replace），
   保证「重启后升级状态仍保持一致」；
-- 进程内 RLock 串行化变更，供并发升级/遥测使用。
+- 进程内 RLock 串行化变更，供并发升级/遥测使用；
+- 加载快照后从活动批次状态重建设备占用：旧版本快照没有
+  device_occupations 字段（原地升级场景），或快照里残留指向
+  已终态批次的占用时，都以「进行中批次」为准自愈——只要批次没走到
+  成功/回滚/取消，它名下的设备就仍被占着；终态批次的占用必被清掉。
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
 from pathlib import Path
 
 from app.models import (
+    BatchState,
     Campaign,
     Credential,
     Device,
     DeviceOccupation,
+    DeviceUpgradeState,
     FirmwareImage,
     TelemetryStats,
     UpgradeEvent,
 )
+
+logger = logging.getLogger("iot.store")
 
 
 class Store:
@@ -92,6 +101,45 @@ class Store:
         self._upgrade_events = {
             k: [UpgradeEvent.from_dict(e) for e in events]
             for k, events in data.get("upgrade_events", {}).items()}
+        self._rebuild_occupations()
+
+    def _rebuild_occupations(self) -> None:
+        """以「进行中批次」为准重建设备占用（幂等，重启多少次结果一致）。
+
+        - 旧版本快照没有 device_occupations 字段（原地升级沿用旧快照），
+          这里从活动批次状态推导回来：进行中批次里仍在 UPGRADING 的设备
+          一律视为被该活动/批次占用；
+        - 快照里指向已终态/不存在批次的占用一律清掉，不会卡住不释放；
+        - 快照里已有的有效占用保留原 acquired_at，不抖动。
+        """
+        rebuilt: dict[str, DeviceOccupation] = {}
+        for campaign in self._campaigns.values():
+            for batch in campaign.batches:
+                if batch.state != BatchState.IN_PROGRESS:
+                    continue
+                for device_id, up in batch.upgrades.items():
+                    if up.state != DeviceUpgradeState.UPGRADING:
+                        continue
+                    existing = self._occupations.get(device_id)
+                    if (existing is not None
+                            and existing.campaign_id == campaign.campaign_id
+                            and existing.batch_id == batch.batch_id):
+                        rebuilt[device_id] = existing
+                    else:
+                        rebuilt[device_id] = DeviceOccupation(
+                            device_id=device_id,
+                            campaign_id=campaign.campaign_id,
+                            batch_id=batch.batch_id,
+                            acquired_at=0.0)
+        recovered = sorted(set(rebuilt) - set(self._occupations))
+        released = sorted(set(self._occupations) - set(rebuilt))
+        if recovered:
+            logger.info("occupations recovered from in-progress batches: %s",
+                        recovered)
+        if released:
+            logger.info("stale occupations dropped (batch terminal): %s",
+                        released)
+        self._occupations = rebuilt
 
     # ---- devices ---------------------------------------------------------
     def put_device(self, device: Device) -> None:
