@@ -139,6 +139,14 @@ PENDING ──upgrade_batch(开始)──▶ IN_PROGRESS ──全部设备健�
 - **重启一致**：占用关系持久化在快照的 `device_occupations` 中。服务在占用期间
   重启，恢复后的占用、活动状态、设备版本与重启前完全一致——重启后另一活动仍抢
   不到同一台设备，只有等原批次走到终态释放后才行；
+- **重启 / 原地升级恢复**：每次启动时 `Gateway` 都会按批次状态重建占用关系
+  （`restore_occupations`，幂等）——
+  - 凡是还有批次停在 `IN_PROGRESS`（未走到成功/回滚/取消终态）的活动，其名下
+    设备一律重建占用，占用查询能查到具体活动与批次；从**上一版快照原地升级**
+    （快照里没有 `device_occupations` 段）也走同一条路径补齐，进行中批次的
+    设备不会被当成空闲、不会被别的活动抢走；
+  - 反过来，指向已终态批次或已不存在批次的残留占用一律释放，不会卡住；
+  - 恢复只在发生变更时落盘，重复执行/反复重启结果不变（不重复占用、不丢占用）；
 - 查询：`GET /api/v1/devices/{id}/occupation` 返回当前占用它的活动与批次，
   未被占用时 `occupied: false`。
 
@@ -165,16 +173,24 @@ PENDING ──upgrade_batch(开始)──▶ IN_PROGRESS ──全部设备健�
 每台设备每次升级往来按**实际发生顺序**追加一条事件（快照 `upgrade_events`，
 重启后仍在），通过 `GET /api/v1/devices/{id}/upgrade-history` 查询：
 
-| event_type | 时机 |
-| --- | --- |
-| `upgrade_started` | 设备随批次进入升级（记录 `from_version → to_version`） |
-| `upgrade_succeeded` | 批次整体成功，设备版本推进到目标版本 |
-| `upgrade_rolled_back` | 健康失败/人工回滚/活动取消导致整批回滚 |
-| `upgrade_cancelled` | 设备随待开始批次被活动取消（未实际升级） |
+| event_type | 时机 | `from_version → to_version` 含义 |
+| --- | --- | --- |
+| `upgrade_started` | 设备随批次进入升级 | 意图记录：升级前版本 → 目标版本（此时尚未改版本） |
+| `upgrade_succeeded` | 批次整体成功，设备版本推进到目标版本 | 实际变迁：升级前版本 → 目标版本 |
+| `upgrade_rolled_back` | 健康失败/人工回滚/活动取消导致整批回滚 | 实际变迁：目标版本 → 设备退回的原版本 |
+| `upgrade_cancelled` | 设备随待开始批次被活动取消（未实际升级） | 当前版本 → 当前版本（无变化） |
 
-> 兼容范围：`upgrade_cancelled` 当前仅记录随待开始批次取消的设备（这些设备
-> 从未被占用、版本从未变化）；进行中批次被取消时走回滚路径，记为
-> `upgrade_rolled_back`。记录只追加、顺序号 `seq` 每台设备内单调递增。
+版本号语义与兼容范围：
+
+- **终态事件（succeeded / rolled_back / cancelled）的 `to_version` 就是该次往来
+  结束后设备真实所在的版本**。因此把一台设备的终态事件按 `seq` 顺序串起来，
+  前一条的 `to_version` 必等于后一条的 `from_version`，最后一条的 `to_version`
+  就是设备当前 `firmware_version`——重启后依然成立；
+- `upgrade_started` 是意图记录，不参与上述落点链（它的 `to_version` 是目标版本，
+  批次失败时设备并不会到达该版本）；
+- 兼容范围：`upgrade_cancelled` 当前仅记录随待开始批次取消的设备（这些设备
+  从未被占用、版本从未变化）；进行中批次被取消时走回滚路径，记为
+  `upgrade_rolled_back`。记录只追加、顺序号 `seq` 每台设备内单调递增。
 
 ### 4.4 新增拒绝原因码（均 409，彼此可区分）
 
@@ -215,8 +231,15 @@ PENDING ──upgrade_batch(开始)──▶ IN_PROGRESS ──全部设备健�
 ```bash
 # 1) 单元测试（覆盖重复/乱序遥测、时间戳回跳、凭据吊销/轮换/过期、
 #    批次失败整批回滚、并发升级、重启一致性、HTTP 各入口，
-#    以及跨活动真实并发争抢、占用释放、暂停/继续/取消、幂等、重启恢复）
+#    以及跨活动真实并发争抢、占用释放、暂停/继续/取消、幂等、重启恢复、
+#    旧版快照原地升级后的占用重建、回滚往来版本落点）
 uv run pytest -q
+
+# 按业务分组查看各用例与执行情况（verbose 列出每条用例）
+uv run pytest -v
+uv run pytest tests/test_recovery.py -v     # 重启/升级恢复专项
+uv run pytest tests/test_governance.py -v   # 占用治理专项
+uv run pytest tests/test_telemetry.py tests/test_auth.py -v  # 遥测/鉴权回归
 
 # 压一压并发争抢（屏障同步的两个活动同时开跑），多跑几轮
 uv run pytest tests/test_governance.py -q
@@ -245,6 +268,26 @@ curl -s -X POST localhost:8000/api/v1/campaigns/cid/cancel \
   -d '{"message":"人工取消"}' -H 'Content-Type: application/json'
 curl -s localhost:8000/api/v1/devices/d1/occupation
 curl -s localhost:8000/api/v1/devices/d1/upgrade-history
+
+# 5) 复现「上一版快照原地升级」：造一份进行中状态，摘掉快照里的
+#    device_occupations 段（模拟旧版未持久化占用），重启后占用应被重建
+uv run python - <<'PY'
+import json
+from app.service import Gateway
+
+gw = Gateway("legacy-state.json")
+gw.upgrade.release_firmware("2.0.0")
+gw.auth.register_device("d1")
+camp = gw.upgrade.create_campaign("2.0.0", ["d1"], batch_size=1)
+gw.upgrade.upgrade_batch(camp.campaign_id, camp.batches[0].batch_id)
+
+data = json.loads(open("legacy-state.json").read())
+data.pop("device_occupations", None)          # 旧版快照没有这一段
+open("legacy-state.json", "w").write(json.dumps(data, indent=2))
+
+gw2 = Gateway("legacy-state.json")            # 原地升级重启
+print(gw2.upgrade.device_occupation("d1"))    # occupied=True，活动/批次可查
+PY
 ```
 
 ### 测试与场景对照
@@ -268,4 +311,9 @@ curl -s localhost:8000/api/v1/devices/d1/upgrade-history
 | 往来记录顺序与实际一致、跨活动连续可查 | `tests/test_governance.py::test_device_history_order_matches_occurrence` |
 | 占用/活动状态/版本/记录重启一致，重启后仍互斥 | `tests/test_governance.py::test_occupation_and_history_survive_restart` |
 | HTTP 跨活动并发争抢返回可区分原因码 | `tests/test_governance.py::test_concurrent_http_contention_distinguishable_reason` |
+| 旧版快照原地升级：进行中批次占用重建、争抢仍被拒、原批次继续推进 | `tests/test_recovery.py::test_legacy_snapshot_in_progress_batch_still_occupies` |
+| 反复重启占用不丢不重、恢复幂等 | `tests/test_recovery.py::test_restore_is_idempotent_across_repeated_restarts` |
+| 终态批次残留占用在重启时被释放、设备可再参加新活动 | `tests/test_recovery.py::test_restore_releases_stale_occupation_of_terminal_batch` |
+| 三种回滚路径的往来落点均为真实版本、重启后仍一致 | `tests/test_recovery.py::test_rollback_history_lands_on_real_version_all_paths` |
+| 重启后取消：释放 + 重复取消/反复重启不二次回滚 | `tests/test_recovery.py::test_cancel_after_restart_releases_and_stays_idempotent` |
 | HTTP 入口结论与门面一致 | `tests/test_api.py` |

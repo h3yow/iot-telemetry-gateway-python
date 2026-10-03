@@ -273,12 +273,15 @@ class UpgradeService:
                     device.upgrade_state = DeviceUpgradeState.ROLLED_BACK
                     up.message = up.message or "同批存在失败设备，整批回滚"
                 self.store.put_device(device)
-                # 终态释放占用，并记录本次回滚往来
+                # 终态释放占用，并记录本次回滚往来。
+                # 回滚是把设备从目标版本拉回原版本：事件的 from/to 必须
+                # 反映真实落点（to_version=设备回退后所在版本），这样
+                # 往来链条按顺序追下去才能落到设备当前版本。
                 self.store.delete_occupation(up.device_id)
                 self._append_event(
                     up.device_id, campaign.campaign_id, batch.batch_id,
                     UpgradeEventType.ROLLED_BACK,
-                    up.from_version, up.to_version, up.message)
+                    up.to_version, up.from_version, up.message)
             batch.state = BatchState.ROLLED_BACK
             logger.info(
                 "batch rolled back campaign=%s batch=%s failed_devices=%s",
@@ -318,6 +321,65 @@ class UpgradeService:
             batch_id=batch_id, event_type=event_type,
             from_version=from_version, to_version=to_version,
             at=self.clock(), message=message))
+
+    # ---- 重启 / 原地升级后的占用恢复 --------------------------------------
+    def restore_occupations(self) -> dict:
+        """从批次状态重建设备占用关系（幂等，每次启动调用一次）。
+
+        上一版快照里没有 device_occupations：原地升级后，仍在
+        IN_PROGRESS 批次名下的设备必须重新被对应活动/批次占着；
+        反过来，指向已终态（succeeded/rolled_back/cancelled）批次或
+        已不存在批次的残留占用一律释放。只有发生变更才落盘。
+        """
+        with self.store.lock():
+            # 期望占用：device_id -> (campaign_id, batch_id)，
+            # 来源是所有活动的进行中批次（先到先占，冲突记告警）。
+            expected: dict[str, tuple[str, str]] = {}
+            for campaign in self.store.list_campaigns():
+                for batch in campaign.batches:
+                    if batch.state != BatchState.IN_PROGRESS:
+                        continue
+                    for device_id in batch.device_ids:
+                        claim = (campaign.campaign_id, batch.batch_id)
+                        prev = expected.get(device_id)
+                        if prev is not None and prev != claim:
+                            logger.warning(
+                                "occupation conflict on restore device=%s "
+                                "keep=%s/%s drop=%s/%s",
+                                device_id, prev[0], prev[1],
+                                claim[0], claim[1])
+                            continue
+                        expected[device_id] = claim
+
+            rebuilt = released = 0
+            # 释放残留：占用指向的批次已终态或不存在
+            for occ in self.store.list_occupations():
+                want = expected.get(occ.device_id)
+                if want is None or want != (occ.campaign_id, occ.batch_id):
+                    self.store.delete_occupation(occ.device_id)
+                    released += 1
+                    logger.info(
+                        "occupation released on restore device=%s "
+                        "stale=%s/%s", occ.device_id,
+                        occ.campaign_id, occ.batch_id)
+            # 重建缺失/纠正错配
+            for device_id, (campaign_id, batch_id) in expected.items():
+                occ = self.store.get_occupation(device_id)
+                if occ is not None and (occ.campaign_id, occ.batch_id) \
+                        == (campaign_id, batch_id):
+                    continue
+                self.store.put_occupation(DeviceOccupation(
+                    device_id=device_id, campaign_id=campaign_id,
+                    batch_id=batch_id, acquired_at=self.clock()))
+                rebuilt += 1
+                logger.info(
+                    "occupation rebuilt on restore device=%s "
+                    "campaign=%s batch=%s", device_id, campaign_id, batch_id)
+            if rebuilt or released:
+                self.store.save()
+            logger.info("occupation restore done rebuilt=%d released=%d",
+                        rebuilt, released)
+            return {"rebuilt": rebuilt, "released": released}
 
     def device_occupation(self, device_id: str) -> dict:
         """查询设备当前被哪个活动占着；未被占用时 occupied=False。"""

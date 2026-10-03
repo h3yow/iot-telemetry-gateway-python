@@ -31,6 +31,8 @@ class Gateway:
             quota_window_seconds=quota_window_seconds,
             quota_max_per_window=quota_max_per_window)
         self.upgrade = UpgradeService(self.store, clock=clock)
+        # 重启 / 原地升级恢复：按批次终态语义重建并清理设备占用（幂等）
+        self.upgrade.restore_occupations()
 
     def authenticated_telemetry(self, device_id: str, token: str | None,
                                 report: dict) -> dict:

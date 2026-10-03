@@ -154,6 +154,9 @@ class Store:
     def delete_occupation(self, device_id: str) -> None:
         self._occupations.pop(device_id, None)
 
+    def list_occupations(self) -> list[DeviceOccupation]:
+        return list(self._occupations.values())
+
     def occupations_for_campaign(self, campaign_id: str
                                  ) -> list[DeviceOccupation]:
         return [o for o in self._occupations.values()
